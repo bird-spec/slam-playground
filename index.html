@@ -1,0 +1,446 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <title>Slam Playground</title>
+        <style>
+            :root{ --bg:#0b0d11; --ink:#e9ebf1; --dim:#79808f; --line:rgba(255,255,255,.08);
+                   --free:#16323a; --wall:#b8762a; --bot:#54d8ea; --beam:#ff9d5c; --front:#7ee081; }
+                   *{box-sizing:border-box}
+                   body{margin:0;background:var(--bg);color:var(--ink);font-family:ui-sans-serif,system-ui,sans-serif;
+                        display:flex;height:100vh;overflow:hidden}
+                   canvas{flex:1;min-width:0;display:block}
+                   #panel{width:230px;padding:16px;border-left:1px solid var(--line);
+                          display:flex;flex-direction:column;gap:14px;overflow:auto}
+                   h1{font-size:15px;margin:0;letter-spacing:-.01em}
+                   .sub{font-size:11.5px;color:var(--dim);line-height:1.45;margin:0}
+                   .row{display:flex;justify-content:space-between;font-size:12px;color:var(--dim)}
+                   .row b{color:var(--ink);font-weight:500;font-variant-numeric:tabular-nums;line-height:1}
+                   .big{font-size:26px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1}
+                   .bar{height:3px;background:rgba(255,255,255,.08);border-radius:2px;overflow:hidden}
+                   .bar i{display:block;height:100%;background:var(--bot);border-radius:2px}
+                   label{font-size:11px;color:var(--dim);display:block;margin-bottom:4px}
+                   input[type=range]{width:100%}
+                   button{font:inherit;font-size:12px;color:var(--ink);background:rgba(255,255,255,.06);
+                          border:1px solid var(--line);border-radius:7px;padding:7px 12px;cursor:pointer;width:100%}
+                   button:hover{background:rgba(255,255,255,.11)}
+                   hr{border:0;border-top:1px solid var(--line);margin:2px 0}
+                   .key{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--dim);padding:1px 0}
+                   .sw{width:9px;height:9px;border-radius:2px;flex:none}
+                   #say{font-size:11.5px;color:var(--front);line-height:1.4;min-height:48px}
+        </style> 
+    </head>
+    <body>
+    
+    <canvas id="c"></canvas>
+
+    <div id="panel">
+      <div>
+        <h1>SLAM Playground</h1>
+        <p class="sub">A robot that has never seen this room works out its shape, then decides where to look next.</p>
+      </div>
+
+      <hr>
+      <div class="big"><span id="cov">0</span><span style="font-size:12px;color:var(--dim)"> %explored</span></div>
+      <div class="bar"><i id="covbar" style="width:0"></i></div>
+
+      <div class="row"><span>Rays cast</span><b id="rays">0</b></div>
+      <div class="row"><span>Distance flown</span><b id="dist">0.0 m</b></div>
+      <div class="row"><span>Frontiers open</span><b id="fr">0</b></div>
+
+      <hr>
+      <label>Sensor beams <span id="nbLbl">4</span></label>
+      <input type="range" id="nb" min="1" max="16" value="4">
+      <label>Sensor range <span id="rgLbl">2.0 m</span></label>
+      <input type="range" id="rg" min="8" max="60" value="20">
+      <label>Speed <span id="spLbl">4x</span></label>
+      <input type="range" id="sp" min="1" max="20" value="4">
+
+      <hr>
+      <button id="again">New room</button>
+
+      <hr>
+      <div class="key"><span class="sw" style="background:var(--free)"></span>mapped as open</div>
+      <div class="key"><span class="sw" style="background:var(--wall)"></span>mapped as wall</div>
+      <div class="key"><span class="sw" style="background:var(--front)"></span>frontier — where it can learn</div>
+      <div class="key"><span class="sw" style="background:var(--beam)"></span>live sensor beam</div>
+
+      <hr>
+      <div id="say">starting up</div>
+</div>
+
+<script>
+        //So anyoen reading this from here on out is the section where the world the robot isnt told any of this nor does it need to know :) i wish o could iget that crisp framwork 12 tho
+
+const W = 16, H = 11, RES = 0.20;    //meters :)
+const GW = Math.round(W/RES), GH = Math.round(H/RES);
+let walls = [];
+
+function buildRoom() {
+       walls = [
+         [0.4,0.4, W-0.4,0.4], [0.4,H-0.4, W-0.4,H-0.4],
+         [0.4,0.4, 0.4,H-0.4], [W-0.4,0.4, W-0.4,H-0.4],
+   
+];
+
+// 2 dividers with a doorway in each - the robot finds thses on its own :)
+const nDiv = 2 + (Math.random() < .5 ? 1 : 0);
+for (let i = 1; i <= nDiv; i ++) {
+       const x = 0.4 + (W-0.8) * i/(nDiv+1);
+       const gap = 1.0 + Math.random()*(H-3.0);
+       walls.push([x,0.4, x,gap])
+       walls.push([x,gap+1.1, x,H-0.4]);
+}
+// some furniture :)
+for (let i = 0; i < 4; i ++) {
+       const x = 1.2 + Math.random()*(W-2.4), y = 1.2 + Math.random()*(H-2.4);
+       const w = .6 + Math.random()*1.2;
+       if (Math.random() < .5) walls.push([x,y, x+w,y])
+       else                    walls.push([x,y, x,y+w])
+}
+}            
+
+function raycast(x, y, th, maxR) {
+       let best = maxR;
+       const dx = Math.cos(th), dy = Math.sin(th);
+       for (const [ax,ay,bx,by] of walls) {
+              const sx = bx-ax, sy = by-ay, den = dx*sy - dy*sx;
+              if (Math.abs(den) < 1e-9) continue;
+              const t = ((ax-x)*sy - (ay-y)*sx)/den;
+              const u = ((ax-x)*dy - (ay-y)*dx)/den;
+              if (t > 0 && u >= 0 && u <= 1 && t < best) best = t;
+       } 
+       return best;
+}
+function crosses(x0,y0,x1,y1) {
+       const d = Math.hypot(x1-x0, y1-y0);
+       if (d < 1e-9) return false;
+       return raycast(x0,y0, Math.atan2(y1-y0,x1-x0), d+0.12) < d+0.12;
+}
+
+// the map -- log odds, not booleans 1 bad reading should nudge a cell, never flip it or single glitch leaves a perma phantom wall :)
+const L_FREE=-0.4, L_OCC=0.85, L_LIM=4, T_OCC=0.5, T_FREE=-0.5;
+let grid;
+
+const idx = (cx,cy) => cy*GW + cx;
+const iny = (cx,cy) => cx>=0 && cx<GW && cy>=0 && cy<GH
+const at  = (cx,cy) => iny(cx,cy) ? grid[idx(cx,cy)] : 0;
+const isOcc  = (cx,cy) => at(cx,cy) > T_OCC;
+const isFree = (cx,cy) => at(cx,cy) < T_FREE;
+const isUnk = (cx,cy) => { const v = at(cx,cy); return v>=T_FREE && v<=T_OCC; };
+
+function bump(cx,cy,d) {
+       if (!iny(cx,cy)) return;
+       const i = idx(cx,cy);
+       grid [i] = Math.max(-L_LIM, Math.min(L_LIM, grid[i]+d));
+}
+
+function bresenham(x0,y0,x1,y1) {
+       const pts = [];
+       let dx = Math.abs(x1-x0), dy = Math.abs(y1-y0);
+       const sx = x0<x1?1:-1, sy = y0<y1?1:-1;
+       let err = dx-dy;
+       for (;;) {
+              pts.push([x0,y0]);
+              if (x0===x1 && y0===y1) return pts;
+              const e2 = 2*err;
+              if (e2 > -dy) { err -= dy; x0 += sx; }
+              if (e2 <  dx) { err += dx; y0 += sy; }
+       }
+}
+
+// a reading at max range means nothing out ther, not "a wall exactly there"
+//marketing that endpoint occupied rings the whole map with a phantom wall :)
+function integrate(x, y, th, dist, maxR) {
+       const hit = dist < maxR - 1e-6;
+       const d = Math.min(dist, maxR);
+       const a = [Math.floor(x/RES), Math.floor(y/RES)];
+       const b = [Math.floor((x+Math.cos(th)*d)/RES), Math.floor((y+Math.sin(th)*d)/RES)];
+       const pts = bresenham(a[0],a[1],b[0],b[1]);
+       for (let i = 0; i < pts.length-1; i++) bump(pts[i][0], pts [i][1], L_FREE);
+       if (hit) bump(b[0], b[1], L_OCC);
+       rays++;
+}
+
+function coverage() { 
+       let n = 0;
+       for (let i = 0; i < grid.length; i++) if (grid[i] < T_FREE || grid[i] > T_OCC) n++;
+       return n/grid.length;
+}
+
+//curiosity - a frontier is knwon-free space touching the unknown. fly to one 
+//and you are guaranteed to learn something. score by information per meter
+//and the robot crosses a room to peer through a door rather than tidying the 
+//corner it is standing in. nothing here in this code knows what a "door" is. :)
+const SAFE = 0.30, PLAN = 0.22, MIN_TRAVEL = 0.7, GAIN_R= 1.2;
+
+function disc(cx,cy,m) {
+       const r = Math.round(m/RES);
+       for (let dy=-r; dy<=r; dy++) for (let dx=-r; dx<=r; dx++)
+         if (dx*dx+dy*dy <= r*r && isOcc(cx+dx,cy+dy)) return false;
+         return true;
+}
+const safeAt = (cx,cy) => disc(cx,cy,SAFE);   //may come to rest here who knows
+const passAt = (cx,cy) => disc(cx,cy,PLAN);   // may transit here :)
+
+function gain(cx,cy) {
+       const r = Math.round(GAIN_R/RES); let n = 0;
+       for (let dy=-r; dy<=r; dy++) for (let dx=-r; dx<=r; dx++)
+         if (dx*dx+dy*dy <= r*r && isUnk(cx+dx,cy+dy)) n++;
+         return n;
+}
+
+function frontiers() {
+       const out = [];
+       for (let cy=0; cy<GH; cy++) for (let cx=0; cx<GW; cx++) {
+          if (!isFree(cx,cy)) continue;
+          if (isUnk(cx+1,cy)||isUnk(cx-1,cy)||isUnk(cx,cy+1)||isUnk(cx,cy-1)) out.push([cx,cy]);
+       }
+       return out;
+}
+ 
+function cluster(cells, min=3) {
+  const todo = new Set(cells.map(c=>c[0]+','+c[1])), groups = [];
+  for (const seed of Array.from(todo)) {
+    if (!todo.has(seed)) continue;
+    todo.delete(seed);
+    const first = seed.split(',').map(Number);
+    const grp = [first], q = [first];
+    while (q.length) {
+      const cur = q.pop();
+      for (let dx=-1; dx<=1; dx++) for (let dy=-1; dy<=1; dy++) {
+        const k = (cur[0]+dx)+','+(cur[1]+dy);
+        if (todo.has(k)) { todo.delete(k); const p=[cur[0]+dx,cur[1]+dy]; grp.push(p); q.push(p); }
+      }
+    }
+    if (grp.length >= min) groups.push(grp);
+  }
+  return groups;
+}
+
+function reachable(start) {
+  const dist = new Map([[start[0]+','+start[1], 0]]);
+  const q = [start];
+  let head = 0;
+  while (head < q.length) {
+    const cur = q[head++], d = dist.get(cur[0]+','+cur[1]);
+    for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+      const nx = cur[0]+dx, ny = cur[1]+dy, k = nx+','+ny;
+      if (dist.has(k) || !iny(nx,ny)) continue;
+      // Unknown cells ARE traversable when planning - otherwise the robot can
+      // never enter the space it is trying to explore.
+      if (isOcc(nx,ny) || !passAt(nx,ny)) continue;
+      dist.set(k, d+1); q.push([nx,ny]);
+    }
+  }
+  return dist;
+}
+
+function nextTarget(p) {
+  const groups = cluster(frontiers());
+  openFrontiers = groups.length;
+  if (!groups.length) return null;
+  const reach = reachable([Math.floor(p.x/RES), Math.floor(p.y/RES)]);
+  let best = null, bestScore = 0, meta = null;
+  for (const grp of groups) {
+    // A frontier you are standing ON is unknown because it is BEHIND the
+    // sensor. The fix is to turn, not to fly to it.
+    const usable = grp.filter(c => {
+      const d = reach.get(c[0]+','+c[1]);
+      if (d === undefined || d*RES < MIN_TRAVEL) return false;
+      return !failed.has(c[0]+','+c[1]);
+    });
+    if (!usable.length) continue;
+    const step = Math.max(1, Math.floor(usable.length/5));
+    for (let i = 0; i < usable.length; i += step) {
+      const c = usable[i];
+      const cost = reach.get(c[0]+','+c[1]) * RES;
+      const g = gain(c[0],c[1]) + grp.length;
+      const s = g/(cost+0.5);
+      if (s > bestScore) { bestScore = s; best = c; meta = [g, cost, grp.length]; }
+    }
+  }
+  if (!best) return null;
+  return { cell: best, x:(best[0]+0.5)*RES, y:(best[1]+0.5)*RES,
+           why:`${meta[0]} unknown cells would come into view — ${meta[1].toFixed(1)} m away` };
+}
+
+function stepToward(p, t, step) {
+  const want = Math.atan2(t.y-p.y, t.x-p.x);
+  const spread = [0,.4,-.4,.8,-.8,1.2,-1.2,1.6,-1.6];
+  // TWO PASSES: insist on the full standoff first, and only accept the tighter
+  // transit clearance when every heading is blocked. That is the doorway case.
+  for (const check of [safeAt, passAt])
+    for (const s of spread) {
+      const th = want+s, nx = p.x+Math.cos(th)*step, ny = p.y+Math.sin(th)*step;
+      const cx = Math.floor(nx/RES), cy = Math.floor(ny/RES);
+      if (iny(cx,cy) && !isOcc(cx,cy) && check(cx,cy)) return {x:nx, y:ny, th};
+    }
+  return null;
+}
+
+// ===========================================================================
+//  THE ROBOT
+// ===========================================================================
+const SWEEP = 16, FLY_BUDGET = 60;
+let pose, target, phase, sweepLeft, flyLeft, rays, travelled, done, lastCov, stale;
+let openFrontiers = 0, beams = [], failed = new Set();
+let nBeams = 4, maxR = 2.0, speed = 4;
+
+function reset() {
+  buildRoom();
+  grid = new Float32Array(GW*GH);
+  pose = { x: 1.2, y: H/2, th: 0 };
+  target = null; phase = 'sweep'; sweepLeft = SWEEP; flyLeft = 0;
+  rays = 0; travelled = 0; done = false; lastCov = 0; stale = 0;
+  beams = []; failed = new Set();
+  say('powered up — nothing mapped yet');
+}
+
+function sense() {
+  beams = [];
+  for (let i = 0; i < nBeams; i++) {
+    const b = (i/nBeams) * Math.PI*2;
+    const th = pose.th + b;
+    const d = raycast(pose.x, pose.y, th, maxR);
+    integrate(pose.x, pose.y, th, d, maxR);
+    beams.push({th, d});
+  }
+}
+
+// Without this the planner has no memory of failure: it re-scores the same
+// unreachable frontier, wins with it again, fails again, and burns the whole
+// run oscillating. Ban the cell AND its neighbours - one cell deep is not
+// enough, the next cell along scores almost identically.
+function giveUp() {
+  if (!target || !target.cell) return;
+  const [cx,cy] = target.cell;
+  for (let dy=-2; dy<=2; dy++) for (let dx=-2; dx<=2; dx++)
+    failed.add((cx+dx)+','+(cy+dy));
+  target = null;
+}
+
+function tick() {
+  if (done) return;
+  sense();
+
+  if (phase === 'sweep') {
+    pose.th += (Math.PI*2)/SWEEP;
+    if (--sweepLeft > 0) return;
+
+    const cov = coverage();
+    // Stop when it stops LEARNING, not when every cell is known. Frontier cells
+    // hard against a wall can never be cleared, so waiting for zero frontiers
+    // waits forever.
+    if (cov - lastCov < 0.0012) {
+      if (++stale >= 14) { done = true; say('done — nothing left in reach worth seeing'); return; }
+    } else stale = 0;
+    lastCov = cov;
+
+    const t = nextTarget(pose);
+    if (!t) { done = true; say('done — no reachable frontier left'); return; }
+    target = t; say(t.why); phase = 'fly'; flyLeft = FLY_BUDGET;
+    return;
+  }
+
+  if (!target || Math.hypot(target.x-pose.x, target.y-pose.y) < 0.35) {
+    phase = 'sweep'; sweepLeft = SWEEP; return;
+  }
+  // Commitment needs a deadline. Sliding along an obstacle, stepToward can
+  // oscillate between two headings and approach forever without arriving.
+  if (--flyLeft <= 0) { giveUp(); phase = 'sweep'; sweepLeft = SWEEP; return; }
+
+  const nx = stepToward(pose, target, 0.16);
+  if (!nx || crosses(pose.x, pose.y, nx.x, nx.y)) {
+    // LEARN FROM THE BUMP - something is there whether or not the beams found
+    // it, so write it into the map.
+    if (nx) { const c=[Math.floor(nx.x/RES),Math.floor(nx.y/RES)]; for(let i=0;i<4;i++) bump(c[0],c[1],1.0); }
+    giveUp();
+    phase = 'sweep'; sweepLeft = SWEEP; return;
+  }
+  travelled += Math.hypot(nx.x-pose.x, nx.y-pose.y);
+  pose = nx;
+}
+
+// ===========================================================================
+//  RENDER
+// ===========================================================================
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let S = 40, OX = 0, OY = 0;
+
+function fit() {
+  cv.width = cv.clientWidth; cv.height = cv.clientHeight;
+  S = Math.min(cv.width/W, cv.height/H) * 0.94;
+  OX = (cv.width - W*S)/2; OY = (cv.height - H*S)/2;
+}
+const px = x => OX + x*S, py = y => OY + y*S;
+
+function draw() {
+  if (cv.width !== cv.clientWidth || cv.height !== cv.clientHeight) fit();
+  ctx.fillStyle = '#0b0d11'; ctx.fillRect(0,0,cv.width,cv.height);
+
+  for (let cy = 0; cy < GH; cy++) for (let cx = 0; cx < GW; cx++) {
+    const v = grid[idx(cx,cy)];
+    if (v > T_OCC)       ctx.fillStyle = '#b8762a';
+    else if (v < T_FREE) ctx.fillStyle = '#16323a';
+    else continue;
+    ctx.fillRect(px(cx*RES), py(cy*RES), S*RES+1, S*RES+1);
+  }
+
+  ctx.fillStyle = 'rgba(126,224,129,.55)';
+  for (const [cx,cy] of frontiers())
+    ctx.fillRect(px(cx*RES)+S*RES*.25, py(cy*RES)+S*RES*.25, S*RES*.5, S*RES*.5);
+
+  // the true room, faint - so you can see what it has NOT found yet
+  ctx.strokeStyle = 'rgba(255,255,255,.10)'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (const [ax,ay,bx,by] of walls) { ctx.moveTo(px(ax),py(ay)); ctx.lineTo(px(bx),py(by)); }
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,157,92,.8)'; ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  for (const {th,d} of beams) {
+    ctx.moveTo(px(pose.x), py(pose.y));
+    ctx.lineTo(px(pose.x+Math.cos(th)*d), py(pose.y+Math.sin(th)*d));
+  }
+  ctx.stroke();
+
+  if (target) {
+    ctx.strokeStyle = '#7ee081'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(px(target.x), py(target.y), S*0.16, 0, 7); ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.translate(px(pose.x), py(pose.y)); ctx.rotate(pose.th);
+  ctx.fillStyle = '#54d8ea';
+  ctx.beginPath();
+  ctx.moveTo(S*.20,0); ctx.lineTo(-S*.12, S*.12); ctx.lineTo(-S*.12,-S*.12);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+
+  hud();
+  requestAnimationFrame(draw);
+}
+
+function hud() {
+  const c = Math.round(coverage()*100);
+  document.getElementById('cov').textContent = c;
+  document.getElementById('covbar').style.width = c + '%';
+  document.getElementById('rays').textContent = rays;
+  document.getElementById('dist').textContent = travelled.toFixed(1) + ' m';
+  document.getElementById('fr').textContent = openFrontiers;
+}
+const say = t => document.getElementById('say').textContent = t;
+
+const nb = document.getElementById('nb'), rg = document.getElementById('rg'), sp = document.getElementById('sp');
+nb.oninput = () => { nBeams = +nb.value; document.getElementById('nbLbl').textContent = nBeams; };
+rg.oninput = () => { maxR = +rg.value/10; document.getElementById('rgLbl').textContent = maxR.toFixed(1)+' m'; };
+sp.oninput = () => { speed = +sp.value; document.getElementById('spLbl').textContent = speed+'x'; };
+       document.getElementById('again').onclick = reset;
+       addEventListener('resize', fit);
+
+       reset(); fit();
+       setInterval(() => { for (let i = 0; i < speed; i++) tick(); }, 33);
+       draw();
+       </script>
+       </body>
+       </html>
