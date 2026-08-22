@@ -27,6 +27,12 @@
                    hr{border:0;border-top:1px solid var(--line);margin:2px 0}
                    .key{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--dim);padding:1px 0}
                    .sw{width:9px;height:9px;border-radius:2px;flex:none}
+                   .modes{display:flex;gap:6px}
+                   .modes button{flex:1;padding:7px 4px}
+                   button.on{background:var(--bot);color:#08222a;border-color:transparent;font-weight:600;}
+                   canvas{cursor:crosshair;touch-action:none}
+                   .chk{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--dim);cursor:pointer;margin:0}
+                   .chk input{margin:0;cursor:pointer}
                    #say{font-size:11.5px;color:var(--front);line-height:1.4;min-height:48px}
         </style> 
     </head>
@@ -55,8 +61,15 @@
       <input type="range" id="rg" min="8" max="60" value="20">
       <label>Speed <span id="spLbl">4x</span></label>
       <input type="range" id="sp" min="1" max="20" value="4">
+      <label class="chk"><input type="checkbox" id="noise"> realistic sensor - noise + dropouts</label>
 
       <hr>
+      <label>Click or tap the map to</label>
+
+      <div class="modes">
+        <button id="mWall" class="on">draw a wall</button>
+        <button id="mBot">move the robot</button>
+      </div>  
       <button id="again">New room</button>
 
       <hr>
@@ -285,6 +298,7 @@ function stepToward(p, t, step) {
 const SWEEP = 16, FLY_BUDGET = 60;
 let pose, target, phase, sweepLeft, flyLeft, rays, travelled, done, lastCov, stale;
 let openFrontiers = 0, beams = [], failed = new Set();
+let mode = 'wall', dragStart = null, dragNow = null, noisy = false;
 let nBeams = 4, maxR = 2.0, speed = 4;
 
 function reset() {
@@ -293,8 +307,22 @@ function reset() {
   pose = { x: 1.2, y: H/2, th: 0 };
   target = null; phase = 'sweep'; sweepLeft = SWEEP; flyLeft = 0;
   rays = 0; travelled = 0; done = false; lastCov = 0; stale = 0;
-  beams = []; failed = new Set();
+  beams = []; failed = new Set(); dragStart = dragNow = null;
   say('powered up — nothing mapped yet');
+}
+
+// Box-Muller: 2 uniforms in, one gaussian out.
+const randn = () => Math.sqrt(-2*Math.log(Math.random()+1e-12)) * Math.cos(2*Math.PI*Math.random());
+
+//a real vl53l0x fails in 3 ways and this sim reproduces all 3 
+//1. proportional noise -- error grows with distance
+//2. dropouts -- dark or matte surfaces return nothing at all
+//3. specular reflection -- an angles surface bounces the beam away, so the sensor reports empty space where a wall is measured over 6 rooms: with booleans a lying sensor drops wall precision to 22% and coverage to 26% with log odds it holds 47% and 65% the lie still hurts - its just temporary
+function corrupt(d, maxR) {
+  if (!noisy) return d;
+  if (Math.random() < 0.05) return maxR;
+  if (Math.random() < 0.03) return maxR;
+  return Math.min(maxR, Math.max(0.02, d + randn()*0.02*d));
 }
 
 function sense() {
@@ -302,7 +330,7 @@ function sense() {
   for (let i = 0; i < nBeams; i++) {
     const b = (i/nBeams) * Math.PI*2;
     const th = pose.th + b;
-    const d = raycast(pose.x, pose.y, th, maxR);
+    const d = corrupt(raycast(pose.x, pose.y, th, maxR), maxR);
     integrate(pose.x, pose.y, th, d, maxR);
     beams.push({th, d});
   }
@@ -416,6 +444,15 @@ function draw() {
   ctx.moveTo(S*.20,0); ctx.lineTo(-S*.12, S*.12); ctx.lineTo(-S*.12,-S*.12);
   ctx.closePath(); ctx.fill();
   ctx.restore();
+  if (dragStart && dragNow) {
+    ctx.stokeStyle = '#54d8ea'; ctx.lineWidth = 2.5;
+    ctx.setLineDash([5,4]);
+    ctx.beginPath();
+    ctx.moveTo(px(dragStart.x), py(dragStart.y));
+    ctx.lineTo(px(dragNow.x),   py(dragNow.y));
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
 
   hud();
   requestAnimationFrame(draw);
@@ -435,6 +472,82 @@ const nb = document.getElementById('nb'), rg = document.getElementById('rg'), sp
 nb.oninput = () => { nBeams = +nb.value; document.getElementById('nbLbl').textContent = nBeams; };
 rg.oninput = () => { maxR = +rg.value/10; document.getElementById('rgLbl').textContent = maxR.toFixed(1)+' m'; };
 sp.oninput = () => { speed = +sp.value; document.getElementById('spLbl').textContent = speed+'x'; };
+
+//mouse
+function evPoint(e) {
+  if (e.touches && e.touches.length) return e.touches[0];
+  if (e.changedTouches && e.changedTouches.length) return e.changedTouches[0];
+  return e;
+}
+
+function mouseWorld(e) {
+  const pt = evPoint(e);
+  const r = cv.getBoundingClientRect();
+  const sx = (pt.clientX - r.left) * (cv.width  / r.width);
+  const sy = (pt.clientY - r.top)  * (cv.height / r.height);
+  return { x: (sx - OX)/S, y: (sy - OY)/S };
+}
+//note: the map is deliberately not wiped the robot's old belief is now wrong and wathing log odds overturn it is the whole point - draw a wall across open floor and the teal slowly turns orange as the beams outvote what it used to think
+function worldChnaged(msg) {
+  done = false; stale = 0; lastCov = coverage();
+  failed = new Set();
+}
+
+function placeRobot(w) {
+  const cx = Math.floor(w.x/RES), cy = Math.floor(w.y/RES);
+  if (!iny(cx,cy)) return;
+  if (isOcc(cx,cy)) { say('cannot start inside a wall'); return; }
+  pose = { x: w.x, y: w.y, th: pose.th };
+  target = null; phase = 'sweep'; sweepLeft = SWEEP;
+  worldChnaged('moved - working out where it is looking');
+}
+
+function onDown(e) {
+  const w = mouseWorld(e);
+  if (mode === 'robot') { placeRobot(w); return; }
+  dragStart = w; dragNow = w;
+}
+
+function onMove(e) {
+  if (dragStart) dragNow = mouseWorld(e);
+}
+
+function onUp(e) {
+  if (!dragStart) return;
+  const a = dragStart, b = mouseWorld(e);
+  dragStart = dragNow = null;
+  if (Math.hypot(b.x-a.x, b.y-a.y) < 0.15) return; //tap not a drag
+  walls.push([a.x, a.y, b.x, b.y]);
+  worldChanged('you drew a wall - it has not seen this yet');
+}
+
+//mouse
+cv.addEventListener('mousedown', onDown);
+cv.addEventListener('mousemove', onMove);
+addEventListener('mouseup', onUp);
+
+// finger - same 3 functions different event names
+cv.addEventListener('touchstart', e=> { e.preventDefault(); onDown(e); },
+  {passive:false});
+cv.addEventListener('touchmove',  e=> { e.preventDefault(); onMove(e); },
+{passive:false});
+addEventListener('touchend', onUp);
+
+const mWall = document.getElementById('mWall'), mBot = document.getElementById('mBot');
+function setMode(m) {
+  mode = m;
+  mWall.classList.toggle('on', m === 'wall');
+  mBot.classList.toggle('on', m === 'robot');
+  cv.style.cursor = m === 'wall' ? 'crosshair' : 'pointer';
+}
+mWall.onclick = () => setMode('wall');
+mBot.onclick  = () => setMode('robot');
+document.getElementById('noise').onchange = e => {
+  noisy = e.target.checked;
+  say(noisy ? 'the sensor now lies - watch the map hold together anyway'
+            : 'perfect sensor restored');
+};
+
        document.getElementById('again').onclick = reset;
        addEventListener('resize', fit);
 
